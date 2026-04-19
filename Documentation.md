@@ -1,5 +1,6 @@
 # CANOPY — Technical Documentation
 
+<img width="1903" height="912" alt="Screenshot_19-4-2026_102119_127 0 0 1" src="https://github.com/user-attachments/assets/c5e9a3df-73d3-47c7-9f43-19af78c11152" />
 
 
 ---
