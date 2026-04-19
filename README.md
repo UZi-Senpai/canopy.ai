@@ -7,6 +7,9 @@ CANOPY is a two-stage multimodal pipeline that detects, classifies, and reports 
 Built for the Gemma 4 Hackathon.
 
 ---
+
+<img width="1152" height="867" alt="canopylogo" src="https://github.com/user-attachments/assets/b9141b24-7484-431b-a404-73f41a8787ce" />
+
 ---
 
 ## What it does
