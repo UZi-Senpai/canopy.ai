@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CANOPY — Forest Intelligence</title>
+
+<!-- Leaflet -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+
+<!-- Fonts -->
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Mono:ital,wght@0,400;0,700;1,400&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+
+<!-- App styles -->
+<link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+</head>
+<body>
+
+<!-- ── Top bar ───────────────────────────────────────────────────────────── -->
+<div id="topbar">
+  <div class="logo">
+    <em>CANOPY</em> - Powered by GEMMA 4
+  </div>
+  <div class="topbar-coords" id="coordNav">
+    <label class="coord-label">Lat</label>
+    <input class="coord-input" id="coordLat" type="number" step="0.0001" min="-90" max="90" placeholder="e.g. 3.8634">
+    <label class="coord-label">Lon</label>
+    <input class="coord-input" id="coordLon" type="number" step="0.0001" min="-180" max="180" placeholder="e.g. 11.5213">
+    <button class="coord-go" id="coordGoBtn" onclick="goToCoords()">Go ↵</button>
+  </div>
+  <div class="topbar-right">
+    <span id="thint" style="font-family:var(--mono);font-size:11px;color:var(--muted)"></span>
+    <span><span class="pulse"></span>GEMMA 4 · 2-EPOCH · 5-INDEX · S2 + SAR</span>
+    <span id="clk">--:-- UTC</span>
+  </div>
+</div>
+
+<!-- ── Map ───────────────────────────────────────────────────────────────── -->
+<div id="map"></div>
+
+<!-- ── Zoom + Window size controls ───────────────────────────────────────── -->
+<div id="zoomControls">
+  <button class="zoom-btn" onclick="map.zoomIn()" title="Zoom in">+</button>
+  <button class="zoom-btn" onclick="map.zoomOut()" title="Zoom out">−</button>
+  <button id="windowBtn" onclick="cycleWindowSize()" title="Cycle analysis window size">⬚ 50 km</button>
+</div>
+
+<!-- ── Cursor preview box + label ────────────────────────────────────────── -->
+<div id="cursorBox"></div>
+<div id="cursorLabel"></div>
+
+<!-- ── Initial hint card ─────────────────────────────────────────────────── -->
+<div id="hint">
+  <div class="hint-icon">⊕</div>
+  <div class="hint-text">
+    Click any forested area<br>
+    A fixed <b>50 × 50 km</b> window will be placed<br>
+    <span style="font-size:10px;opacity:0.6">Sentinel-2 · 2-epoch same-season · 5 indices · pixel-level spatial analysis · SAR · Gemma 4 biome-aware</span>
+  </div>
+</div>
+
+<!-- ── Bottom action bar ─────────────────────────────────────────────────── -->
+<div id="actionBar">
+  <div class="bbox-chips" id="bchips"></div>
+  <div class="btns">
+    <button class="btn btn-ghost" onclick="clearSel()">Clear</button>
+    <button class="btn btn-primary" id="abtn" onclick="runAnalysis()">
+      <span class="spin" id="sp"></span>
+      <span id="abtntxt">▶ Analyse</span>
+    </button>
+  </div>
+</div>
+
+<!-- ── Results drawer ────────────────────────────────────────────────────── -->
+<div id="drawer">
+  <div class="dhead">
+    <span class="dtitle" id="dtitle">Analysis Report</span>
+    <div class="dhead-btns">
+      <button class="reportbtn" id="reportbtn" onclick="openFullReport()">
+        ↗ Report Ready
+      </button>
+      <button class="xbtn" onclick="closeDrawer()">✕</button>
+    </div>
+  </div>
+
+  <!-- Loading state -->
+  <div id="dload">
+    <div class="pb-header">
+      <span class="pb-title">ANALYSING</span>
+      <span id="pb-pct">0%</span>
+    </div>
+    <div class="pb-track"><div class="pb-fill" id="pbfill"></div></div>
+    <div class="steps">
+      <div class="step" id="s0"><span class="sdot"></span>Geocoding region…</div>
+      <div class="step" id="s1"><span class="sdot"></span>Fetching Sentinel-2 baseline (−2yr, same season)…</div>
+      <div class="step" id="s2"><span class="sdot"></span>Fetching Sentinel-2 current (resolution-scaled)…</div>
+      <div class="step" id="s3"><span class="sdot"></span>Computing NDVI · EVI · NBR · BSI · NDWI + SCL mask…</div>
+      <div class="step" id="s4"><span class="sdot"></span>Fetching Sentinel-1 SAR (2-epoch, cloud-independent)…</div>
+      <div class="step" id="s5"><span class="sdot"></span>Gemma Stage 1 — biome-aware visual extraction (2 images)…</div>
+      <div class="step" id="s6"><span class="sdot"></span>Gemma Stage 2 — spatial + spectral synthesis with visual cross-check…</div>
+    </div>
+    <div class="pb-eta" id="pb-eta">Estimated time: ~2 min</div>
+  </div>
+
+  <!-- Results -->
+  <div id="dres"></div>
+</div>
+
+<!-- Leaflet -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<!-- App logic -->
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
