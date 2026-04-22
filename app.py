@@ -4,6 +4,7 @@ import base64
 import io
 import math
 import time
+import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from flask import Flask, request, jsonify, render_template
@@ -368,9 +369,11 @@ def compute_indices_ndvi_evi(img_bytes):
     """R=NDVI, G=EVI, B=SCL. Returns ndvi, evi, cloud_pct, valid_px, scl_stats."""
     img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
     a   = np.asarray(img, dtype=np.float32)
+    img.close()
     ndvi = (a[:,:,0] / 255.0) * 2.0 - 1.0
     evi  = (a[:,:,1] / 255.0) * 2.0 - 1.0
     scl  = a[:,:,2].astype(np.uint8)
+    del a
 
     nodata = (scl == 0)
     cloud  = np.isin(scl, list(SCL_CLOUD | SCL_CLOUD_SHADOW))
@@ -386,37 +389,53 @@ def compute_indices_ndvi_evi(img_bytes):
         "snow_pct":         float(np.sum(scl == 11) / total * 100),
     }
     if valid_px < 500:
+        del ndvi, evi, scl, nodata, cloud, valid
         return float('nan'), float('nan'), cloud_pct, valid_px, scl_stats
-    return float(np.mean(ndvi[valid])), float(np.mean(evi[valid])), cloud_pct, valid_px, scl_stats
+    ndvi_mean = float(np.mean(ndvi[valid]))
+    evi_mean  = float(np.mean(evi[valid]))
+    del ndvi, evi, scl, nodata, cloud, valid
+    return ndvi_mean, evi_mean, cloud_pct, valid_px, scl_stats
 
 
 def compute_nbr_bsi_ndwi(img_bytes):
     """R=NBR, G=BSI, B=NDWI. Returns nbr, bsi, ndwi."""
     img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
     a   = np.asarray(img, dtype=np.float32)
+    img.close()
     nbr  = (a[:,:,0] / 255.0) * 2.0 - 1.0
     bsi  = (a[:,:,1] / 255.0) * 2.0 - 1.0
     ndwi = (a[:,:,2] / 255.0) * 2.0 - 1.0
     valid = (a[:,:,0] > 1) & (a[:,:,0] < 254)
+    del a
     if int(np.sum(valid)) < 200:
+        del nbr, bsi, ndwi, valid
         return float('nan'), float('nan'), float('nan')
-    return float(np.mean(nbr[valid])), float(np.mean(bsi[valid])), float(np.mean(ndwi[valid]))
+    result = float(np.mean(nbr[valid])), float(np.mean(bsi[valid])), float(np.mean(ndwi[valid]))
+    del nbr, bsi, ndwi, valid
+    return result
 
 
 def compute_sar_stats(img_bytes):
     img = Image.open(io.BytesIO(img_bytes)).convert('L')
     a   = np.asarray(img, dtype=np.float32)
+    img.close()
     vh_db = (a / 255.0) * 40.0 - 35.0
     valid = (a > 1) & (a < 254)
+    del a
     if int(np.sum(valid)) < 200:
+        del vh_db, valid
         return float('nan'), {}
     vh_v = vh_db[valid]
-    return float(np.mean(vh_v)), {
+    del vh_db, valid
+    stats = {
         "high_backscatter_pct":   float(np.sum(vh_v >= -14) / len(vh_v) * 100),
         "medium_backscatter_pct": float(np.sum((vh_v >= -20) & (vh_v < -14)) / len(vh_v) * 100),
         "low_backscatter_pct":    float(np.sum(vh_v < -20) / len(vh_v) * 100),
         "std_db":                 round(float(np.std(vh_v)), 2),
     }
+    mean_vh = float(np.mean(vh_v))
+    del vh_v
+    return mean_vh, stats
 
 
 def build_change_overlay(now_bytes, base_bytes):
@@ -426,10 +445,14 @@ def build_change_overlay(now_bytes, base_bytes):
     ndvi_base = ab[:,:,0] / 255.0 * 2.0 - 1.0
     scl_now   = an[:,:,1].astype(np.uint8)
     scl_base  = ab[:,:,1].astype(np.uint8)
+    del an, ab
     delta = ndvi_now - ndvi_base
+    del ndvi_now, ndvi_base
     vn = np.isin(scl_now,  list(SCL_VALID_LAND))
     vb = np.isin(scl_base, list(SCL_VALID_LAND))
+    del scl_now, scl_base
     both = vn & vb
+    del vn, vb
     h, w = delta.shape
     rgba = np.zeros((h, w, 4), dtype=np.uint8)
     loss = both & (delta < -0.08); sev = both & (delta < -0.15)
@@ -441,7 +464,9 @@ def build_change_overlay(now_bytes, base_bytes):
     rgba[stable, 0] = 60; rgba[stable, 1] = 80; rgba[stable, 2] = 70; rgba[stable, 3] = 25
     tv = max(int(np.sum(both)), 1)
     img = Image.fromarray(rgba, 'RGBA')
+    del rgba
     buf = io.BytesIO(); img.save(buf, format='PNG')
+    img.close()
 
     # ── Spatial concentration: divide image into 3×3 grid, find max-loss cell ─
     loss_arr = loss.astype(np.float32)
@@ -458,7 +483,7 @@ def build_change_overlay(now_bytes, base_bytes):
     mean_cell_loss_pct = float(np.mean(cell_loss_pcts))
     concentration_ratio = max_cell_loss_pct / max(mean_cell_loss_pct, 0.01)
 
-    return buf.getvalue(), {
+    stats = {
         'loss_pct':             round(float(np.sum(loss)) / tv * 100, 1),
         'severe_loss_pct':      round(float(np.sum(sev))  / tv * 100, 1),
         'gain_pct':             round(float(np.sum(gain)) / tv * 100, 1),
@@ -466,6 +491,8 @@ def build_change_overlay(now_bytes, base_bytes):
         'max_cell_loss_pct':    round(max_cell_loss_pct, 1),
         'concentration_ratio':  round(concentration_ratio, 2),
     }
+    del delta, both, loss, sev, gain, stable, loss_arr
+    return buf.getvalue(), stats
 
 
 def interpret_sar_change(vh_now, vh_base):
@@ -899,7 +926,9 @@ def analyse_point():
 
         # ── NDVI + EVI ────────────────────────────────────────────────────────
         ndvi_now,  evi_now,  cloud_now,  valid_now,  scl_now  = compute_indices_ndvi_evi(results["s2a_now"])
+        results.pop("s2a_now", None)
         ndvi_base, evi_base, cloud_base, valid_base, scl_base = compute_indices_ndvi_evi(results["s2a_base"])
+        results.pop("s2a_base", None)
 
         if math.isnan(ndvi_now) or math.isnan(ndvi_base):
             return jsonify({'success': False,
@@ -910,8 +939,8 @@ def analyse_point():
 
         # ── NBR + BSI + NDWI ─────────────────────────────────────────────────
         nan3 = (float('nan'), float('nan'), float('nan'))
-        nbr_now,  bsi_now,  ndwi_now  = compute_nbr_bsi_ndwi(results["s2b_now"])  if "s2b_now"  in results else nan3
-        nbr_base, bsi_base, ndwi_base = compute_nbr_bsi_ndwi(results["s2b_base"]) if "s2b_base" in results else nan3
+        nbr_now,  bsi_now,  ndwi_now  = compute_nbr_bsi_ndwi(results.pop("s2b_now",  None) or b'') if "s2b_now"  in results else nan3
+        nbr_base, bsi_base, ndwi_base = compute_nbr_bsi_ndwi(results.pop("s2b_base", None) or b'') if "s2b_base" in results else nan3
 
         def dn(a, b): return a - b if not (math.isnan(a) or math.isnan(b)) else float('nan')
         nbr_delta = dn(nbr_now, nbr_base); bsi_delta = dn(bsi_now, bsi_base)
@@ -921,10 +950,12 @@ def analyse_point():
         sar_available = False
         try:
             if "s1_now" in results and "s1_base" in results:
-                vh_now,  _ = compute_sar_stats(results["s1_now"])
-                vh_base, _ = compute_sar_stats(results["s1_base"])
+                vh_now,  _ = compute_sar_stats(results.pop("s1_now"))
+                vh_base, _ = compute_sar_stats(results.pop("s1_base"))
                 sar_available = not (math.isnan(vh_now) or math.isnan(vh_base))
         except Exception as exc:
+            results.pop("s1_now",  None)
+            results.pop("s1_base", None)
             app.logger.warning("SAR error: %s", exc)
 
         sar_delta_nb, sar_label, sar_defor_flag = interpret_sar_change(vh_now, vh_base)
@@ -932,10 +963,10 @@ def analyse_point():
         # ── Change overlay ────────────────────────────────────────────────────
         change_overlay_bytes = None; change_stats = {}
         try:
-            change_overlay_bytes, change_stats = build_change_overlay(
-                results.get("cm_now", results["s2a_now"]),
-                results.get("cm_base", results["s2a_base"]),
-            )
+            cm_now_bytes  = results.pop("cm_now",  results.get("s2a_now"))
+            cm_base_bytes = results.pop("cm_base", results.get("s2a_base"))
+            change_overlay_bytes, change_stats = build_change_overlay(cm_now_bytes, cm_base_bytes)
+            del cm_now_bytes, cm_base_bytes
         except Exception as exc: app.logger.warning("Overlay error: %s", exc)
 
         # ── Stage 1 ───────────────────────────────────────────────────────────
@@ -972,6 +1003,15 @@ def analyse_point():
         )
         report = call_gemma_stage2(prompt, results["tc_now"], results["tc_base"])
 
+        # ── Base64-encode images for response, then free raw bytes ────────────
+        cur_image_b64  = base64.b64encode(results.pop("tc_now")).decode()
+        base_image_b64 = base64.b64encode(results.pop("tc_base")).decode()
+        change_overlay_b64 = base64.b64encode(change_overlay_bytes).decode() if change_overlay_bytes else None
+        del change_overlay_bytes
+        # All satellite image bytes are now freed; only scalars and b64 strings remain
+        results.clear()
+        gc.collect()
+
         def safe(v, d=4): return round(v, d) if not math.isnan(v) else None
         px, _ = optimal_pixel_size(km)
         effective_gsd_m = round((km * 1000) / px)
@@ -980,9 +1020,9 @@ def analyse_point():
             'success': True,
             'report': report,
             'visual_extraction': ve,
-            'cur_image_b64':  base64.b64encode(results["tc_now"]).decode(),
-            'base_image_b64': base64.b64encode(results["tc_base"]).decode(),
-            'change_overlay_b64': base64.b64encode(change_overlay_bytes).decode() if change_overlay_bytes else None,
+            'cur_image_b64':  cur_image_b64,
+            'base_image_b64': base_image_b64,
+            'change_overlay_b64': change_overlay_b64,
             'meta': {
                 'region': region,
                 'sensor': 'Sentinel-2 L2A + Sentinel-1 GRD' if sar_available else 'Sentinel-2 L2A',
@@ -1042,4 +1082,4 @@ def analyse_point():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    app.run()
