@@ -26,7 +26,7 @@ gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 SH_TOKEN_URL   = "https://services.sentinel-hub.com/oauth/token"
 SH_PROCESS_URL = "https://services.sentinel-hub.com/api/v1/process"
 
-# ── Stage 1 system prompt — biome-aware, 3-image, no spectral context ─────────
+# ── Stage 1 system prompt — biome-aware, 2-image, no spectral context ─────────
 STAGE1_SYSTEM_PROMPT = """You are an expert remote sensing analyst specialising in land-cover classification
 and change detection using multispectral satellite imagery. You are RIGOROUS and scientifically precise.
 
@@ -80,7 +80,7 @@ STRICT OUTPUT RULES:
 - Percentage values must be floats 0.0-100.0.
 - If the scene is NOT forest, set is_forest_scene=false and explain in biome_classification."""
 
-# ── Stage 2 system prompt — multi-index, 3-epoch, seasonal-aware synthesis ────
+# ── Stage 2 system prompt — multi-index, 2-epoch, seasonal-aware synthesis ────
 STAGE2_SYSTEM_PROMPT = """You are a senior remote sensing scientist and conservation ecologist with
 20 years of experience in multi-sensor satellite data fusion, SAR interpretation, and global
 deforestation dynamics across all biome types.
@@ -173,6 +173,43 @@ def get_sh_token():
     return _sh_token_cache["token"]
 
 
+# ── Image compression helper ──────────────────────────────────────────────────
+
+def compress_for_gemma(img_bytes, max_px=768, quality=82):
+    """
+    Compress a satellite PNG to JPEG before sending to the Gemma 4 API.
+    Sentinel-2 truecolor PNGs at 1024 px are ~2-4 MB each; at 768 px JPEG
+    they drop to ~120-180 KB — a ~20x reduction that eliminates the payload
+    size overflows that cause Google-side 500 INTERNAL errors.
+    """
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    w, h = img.size
+    if max(w, h) > max_px:
+        ratio = max_px / max(w, h)
+        img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=quality)
+    img.close()
+    return buf.getvalue()
+
+
+# ── Gemma retry wrapper ───────────────────────────────────────────────────────
+
+def gemma_with_retry(fn, *args, retries=3):
+    """
+    Retry a Gemma API call up to `retries` times on transient 500 INTERNAL errors.
+    Uses exponential backoff: 1 s, 2 s, 4 s.
+    """
+    for i in range(retries):
+        try:
+            return fn(*args)
+        except Exception as e:
+            if i < retries - 1 and ("500" in str(e) or "INTERNAL" in str(e)):
+                time.sleep(2 ** i)
+                continue
+            raise
+
+
 # ── Evalscripts ───────────────────────────────────────────────────────────────
 
 # A: NDVI (R) + EVI (G) + SCL (B)
@@ -258,15 +295,15 @@ function evaluatePixel(s) {
 
 def optimal_pixel_size(km):
     """
-    Return (width, height) that keeps effective GSD ≤ 20 m.
+    Return (width, height) that keeps effective GSD <= 20 m.
     Sentinel-2 native is 10 m; 512px at 10 km = ~20 m GSD — the upper limit we honour.
     At larger windows we scale pixels up proportionally, capped at 1024 to stay within
     Sentinel Hub's free-tier output size limits.
     """
-    target_gsd_m = 20          # effective GSD ceiling in metres
+    target_gsd_m = 20
     km_per_pixel = target_gsd_m / 1000.0
     px = int(round(km / km_per_pixel))
-    px = max(256, min(px, 1024))  # always between 256 and 1024
+    px = max(256, min(px, 1024))
     return px, px
 
 
@@ -479,7 +516,6 @@ def build_change_overlay(now_bytes, base_bytes):
             denom = max(int(np.sum(both_cell)), 1)
             cell_loss_pcts.append(float(np.sum(cell)) / denom * 100)
     max_cell_loss_pct = max(cell_loss_pcts)
-    # Concentration ratio: how much is clearing confined to a single cell?
     mean_cell_loss_pct = float(np.mean(cell_loss_pcts))
     concentration_ratio = max_cell_loss_pct / max(mean_cell_loss_pct, 0.01)
 
@@ -511,7 +547,7 @@ def compute_severity(ndvi_delta, sar_label, nbr_delta=None, bsi_delta=None,
                      visual_extraction=None, change_stats=None):
     """
     Severity is driven by the WORST of: scene-mean spectral signal OR spatial pixel-level signal.
-    A 5% localized clearing in a 50×50 km window has near-zero mean NDVI delta but is HIGH concern.
+    A 5% localized clearing in a 50x50 km window has near-zero mean NDVI delta but is HIGH concern.
     """
     ORDER = ["low", "medium", "high", "critical"]
     def bump(b, n=1): return ORDER[min(ORDER.index(b) + n, 3)]
@@ -531,7 +567,6 @@ def compute_severity(ndvi_delta, sar_label, nbr_delta=None, bsi_delta=None,
         max_cell        = change_stats.get('max_cell_loss_pct', 0) or 0
         conc            = change_stats.get('concentration_ratio', 1) or 1
 
-        # Hard floor from pixel loss — even if mean NDVI is near-zero
         if severe_loss_pct >= 10 or loss_pct >= 20:
             base = ORDER[max(ORDER.index(base), ORDER.index("critical"))]
         elif severe_loss_pct >= 5 or loss_pct >= 10:
@@ -539,11 +574,10 @@ def compute_severity(ndvi_delta, sar_label, nbr_delta=None, bsi_delta=None,
         elif loss_pct >= 3 or severe_loss_pct >= 1.5:
             base = ORDER[max(ORDER.index(base), ORDER.index("medium"))]
 
-        # Concentrated clearing is more alarming than diffuse — bump an extra level
         if max_cell >= 15 and conc >= 3.0:
-            base = bump(base)  # localized hotspot
+            base = bump(base)
         elif max_cell >= 8 and conc >= 2.0:
-            base = bump(base)  # moderately concentrated
+            base = bump(base)
 
     # ── Additional spectral bumps ─────────────────────────────────────────────
     if nbr_delta is not None and not math.isnan(nbr_delta) and nbr_delta < -0.20:
@@ -651,10 +685,21 @@ def build_stage1_prompt(region, clat, clon, km, cur_from, cur_to, base_from, bas
 
 def call_gemma_stage1(tc_now, tc_base, region, clat, clon, km,
                       cur_from, cur_to, base_from, base_to):
+    """
+    Stage 1 visual extraction using Gemma 4.
+    Images are compressed to JPEG at 768 px before sending to avoid
+    Google-side 500 INTERNAL errors caused by large PNG payloads.
+    """
     prompt = build_stage1_prompt(region, clat, clon, km, cur_from, cur_to, base_from, base_to)
     parts = [
-        types.Part(inline_data=types.Blob(mime_type="image/png", data=base64.b64encode(tc_base).decode())),
-        types.Part(inline_data=types.Blob(mime_type="image/png", data=base64.b64encode(tc_now).decode())),
+        types.Part(inline_data=types.Blob(
+            mime_type="image/jpeg",
+            data=base64.b64encode(compress_for_gemma(tc_base)).decode()
+        )),
+        types.Part(inline_data=types.Blob(
+            mime_type="image/jpeg",
+            data=base64.b64encode(compress_for_gemma(tc_now)).decode()
+        )),
         types.Part(text=prompt),
     ]
     resp = gemini_client.models.generate_content(
@@ -774,7 +819,7 @@ def build_stage2_prompt(
         if cs.get('max_cell_loss_pct', 0) >= 8 and not ve.get('active_clearing_detected'):
             ag.append("SPATIAL ALERT: pixel overlay shows localized loss hotspot but Stage 1 did not flag active clearing — examine image directly")
     ag_block = ("── Signal Agreement Analysis ───────────────────────────────────────────\n"
-                + "".join(f"  ⚡ {n}\n" for n in ag)) if ag else ""
+                + "".join(f"  ! {n}\n" for n in ag)) if ag else ""
 
     nbr_note  = ('(HIGH SEVERITY BURN)' if not math.isnan(d_nbr_nb) and d_nbr_nb < -0.27 else
                  '(LOW SEVERITY BURN)'  if not math.isnan(d_nbr_nb) and d_nbr_nb < -0.10 else '')
@@ -800,7 +845,7 @@ def build_stage2_prompt(
         f"Use your vision to cross-check the data below. If you see clearing or roads the "
         f"Stage 1 summary missed, state your own finding and override where justified.\n\n"
         f"── (A) Spectral Analysis ─────────────────────────────────────────────────\n"
-        f"Index interpretation: NDVI/EVI −1→+1 (higher=greener). NBR high=healthy, low=burned.\n"
+        f"Index interpretation: NDVI/EVI -1→+1 (higher=greener). NBR high=healthy, low=burned.\n"
         f"BSI: positive=bare soil, negative=vegetated. NDWI: high=wet canopy, low=stressed/cleared.\n\n"
         f"                BASELINE               CURRENT\n"
         f"                {base_from}–{base_to}   {cur_from}–{cur_to}\n"
@@ -830,9 +875,19 @@ def build_stage2_prompt(
 
 
 def call_gemma_stage2(prompt, tc_now_bytes, tc_base_bytes):
+    """
+    Stage 2 synthesis using Gemma 4.
+    Images are compressed to JPEG at 768 px before sending — same reason as Stage 1.
+    """
     parts = [
-        types.Part(inline_data=types.Blob(mime_type="image/png", data=base64.b64encode(tc_base_bytes).decode())),
-        types.Part(inline_data=types.Blob(mime_type="image/png", data=base64.b64encode(tc_now_bytes).decode())),
+        types.Part(inline_data=types.Blob(
+            mime_type="image/jpeg",
+            data=base64.b64encode(compress_for_gemma(tc_base_bytes)).decode()
+        )),
+        types.Part(inline_data=types.Blob(
+            mime_type="image/jpeg",
+            data=base64.b64encode(compress_for_gemma(tc_now_bytes)).decode()
+        )),
         types.Part(text=prompt),
     ]
     resp = gemini_client.models.generate_content(
@@ -892,7 +947,7 @@ def health():
         'status': 'ok', 'model': 'gemma-4-26b-a4b-it',
         'pipeline': 'two-stage gemma | 2-epoch | 5-index (NDVI, EVI, NBR, BSI, NDWI)',
         'sensors': 'Sentinel-2 L2A + Sentinel-1 GRD',
-        'epochs': 'baseline (−2yr same season) / current',
+        'epochs': 'baseline (-2yr same season) / current',
     })
 
 
@@ -969,8 +1024,9 @@ def analyse_point():
             del cm_now_bytes, cm_base_bytes
         except Exception as exc: app.logger.warning("Overlay error: %s", exc)
 
-        # ── Stage 1 ───────────────────────────────────────────────────────────
-        ve = call_gemma_stage1(
+        # ── Stage 1 — with retry on transient 500s ────────────────────────────
+        ve = gemma_with_retry(
+            call_gemma_stage1,
             results["tc_now"], results["tc_base"],
             region, clat, clon, km,
             cur_from, cur_to, base_from, base_to,
@@ -989,7 +1045,7 @@ def analyse_point():
             visual_extraction=ve, nbr_avail=not math.isnan(nbr_now),
         )
 
-        # ── Stage 2 ───────────────────────────────────────────────────────────
+        # ── Stage 2 — with retry on transient 500s ────────────────────────────
         prompt = build_stage2_prompt(
             region, clat, clon, km,
             ndvi_now, evi_now, ndvi_base, evi_base,
@@ -1001,14 +1057,16 @@ def analyse_point():
             cur_from, cur_to, base_from, base_to,
             ve, change_stats,
         )
-        report = call_gemma_stage2(prompt, results["tc_now"], results["tc_base"])
+        report = gemma_with_retry(
+            call_gemma_stage2,
+            prompt, results["tc_now"], results["tc_base"],
+        )
 
         # ── Base64-encode images for response, then free raw bytes ────────────
         cur_image_b64  = base64.b64encode(results.pop("tc_now")).decode()
         base_image_b64 = base64.b64encode(results.pop("tc_base")).decode()
         change_overlay_b64 = base64.b64encode(change_overlay_bytes).decode() if change_overlay_bytes else None
         del change_overlay_bytes
-        # All satellite image bytes are now freed; only scalars and b64 strings remain
         results.clear()
         gc.collect()
 
